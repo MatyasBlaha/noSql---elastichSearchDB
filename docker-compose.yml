@@ -1,0 +1,325 @@
+# ELK Stack – Semestrální projekt
+# Elasticsearch 8.17 (3 uzly) + Logstash 8.17 + Kibana 8.17
+# Architektura: 1x dedicated master + 2x data+ingest
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # SETUP – generování TLS certifikátů a nastavení hesel
+  # Spustí se jednou, vygeneruje CA + certifikáty pro všechny uzly,
+  # nastaví heslo pro kibana_system uživatele.
+  # ---------------------------------------------------------------------------
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+    user: "0"
+    command: >
+      bash -c '
+        if [ x${ELASTIC_PASSWORD} == x ]; then
+          echo "Set the ELASTIC_PASSWORD environment variable in the .env file";
+          exit 1;
+        elif [ x${KIBANA_PASSWORD} == x ]; then
+          echo "Set the KIBANA_PASSWORD environment variable in the .env file";
+          exit 1;
+        fi;
+        if [ ! -f config/certs/ca.zip ]; then
+          echo "Creating CA";
+          bin/elasticsearch-certutil ca --silent --pem -out config/certs/ca.zip;
+          unzip config/certs/ca.zip -d config/certs;
+        fi;
+        if [ ! -f config/certs/certs.zip ]; then
+          echo "Creating certs";
+          echo -ne \
+          "instances:\n"\
+          "  - name: es-master\n"\
+          "    dns:\n"\
+          "      - es-master\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          "  - name: es-data-1\n"\
+          "    dns:\n"\
+          "      - es-data-1\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          "  - name: es-data-2\n"\
+          "    dns:\n"\
+          "      - es-data-2\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
+          > config/certs/instances.yml;
+          bin/elasticsearch-certutil cert --silent --pem -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
+          unzip config/certs/certs.zip -d config/certs;
+        fi;
+        echo "Setting file permissions";
+        chown -R root:root config/certs;
+        find config/certs -type d -exec chmod 755 \{\} \;;
+        find config/certs -type f -exec chmod 644 \{\} \;;
+        echo "Waiting for Elasticsearch availability";
+        until curl -s --cacert config/certs/ca/ca.crt https://es-master:9200 | grep -q "missing authentication credentials"; do sleep 30; done;
+        echo "Setting kibana_system password";
+        until curl -s -X POST --cacert config/certs/ca/ca.crt -u "elastic:${ELASTIC_PASSWORD}" -H "Content-Type: application/json" https://es-master:9200/_security/user/kibana_system/_password -d "{\"password\":\"${KIBANA_PASSWORD}\"}" | grep -q "^{}"; do sleep 10; done;
+        echo "All done!";
+      '
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f config/certs/es-master/es-master.crt ]"]
+      interval: 1s
+      timeout: 5s
+      retries: 120
+    networks:
+      - elk-net
+
+  # ---------------------------------------------------------------------------
+  # ES-MASTER – dedikovaný master uzel
+  # Řídí cluster state, volbu leadera, přidělování shardů.
+  # Nedrží data – zaručuje stabilitu clusteru i pod zátěží.
+  # ---------------------------------------------------------------------------
+  es-master:
+    depends_on:
+      setup:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+      - es-master-data:/usr/share/elasticsearch/data
+    environment:
+      - node.name=es-master
+      - node.roles=master
+      - cluster.name=${CLUSTER_NAME}
+      - cluster.initial_master_nodes=es-master
+      - discovery.seed_hosts=es-data-1,es-data-2
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/es-master/es-master.key
+      - xpack.security.http.ssl.certificate=certs/es-master/es-master.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/es-master/es-master.key
+      - xpack.security.transport.ssl.certificate=certs/es-master/es-master.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.license.self_generated.type=${LICENSE}
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    mem_limit: ${MEM_LIMIT_MASTER}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    networks:
+      - elk-net
+
+  # ---------------------------------------------------------------------------
+  # ES-DATA-1 – datový uzel s ingest pipeline
+  # Ukládá shardy indexů, vykonává CRUD a search operace.
+  # Ingest role umožňuje pre-processing dokumentů z Logstashe.
+  # ---------------------------------------------------------------------------
+  es-data-1:
+    depends_on:
+      es-master:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+      - es-data-1-data:/usr/share/elasticsearch/data
+    ports:
+      - ${ES_PORT}:9200
+    environment:
+      - node.name=es-data-1
+      - node.roles=data,ingest
+      - cluster.name=${CLUSTER_NAME}
+      - cluster.initial_master_nodes=es-master
+      - discovery.seed_hosts=es-master,es-data-2
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/es-data-1/es-data-1.key
+      - xpack.security.http.ssl.certificate=certs/es-data-1/es-data-1.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/es-data-1/es-data-1.key
+      - xpack.security.transport.ssl.certificate=certs/es-data-1/es-data-1.crt
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.license.self_generated.type=${LICENSE}
+      - ES_JAVA_OPTS=-Xms768m -Xmx768m
+    mem_limit: ${MEM_LIMIT_DATA}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    networks:
+      - elk-net
+
+  # ---------------------------------------------------------------------------
+  # ES-DATA-2 – druhý datový uzel s ingest pipeline
+  # Zajišťuje distribuci shardů a replik napříč uzly.
+  # ---------------------------------------------------------------------------
+  es-data-2:
+    depends_on:
+      es-master:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+      - es-data-2-data:/usr/share/elasticsearch/data
+    environment:
+      - node.name=es-data-2
+      - node.roles=data,ingest
+      - cluster.name=${CLUSTER_NAME}
+      - cluster.initial_master_nodes=es-master
+      - discovery.seed_hosts=es-master,es-data-1
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/es-data-2/es-data-2.key
+      - xpack.security.http.ssl.certificate=certs/es-data-2/es-data-2.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/es-data-2/es-data-2.key
+      - xpack.security.transport.ssl.certificate=certs/es-data-2/es-data-2.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.license.self_generated.type=${LICENSE}
+      - ES_JAVA_OPTS=-Xms768m -Xmx768m
+    mem_limit: ${MEM_LIMIT_DATA}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    networks:
+      - elk-net
+
+  # ---------------------------------------------------------------------------
+  # KIBANA – webové rozhraní pro vizualizaci a správu ES
+  # Připojuje se na es-data-1 přes HTTPS s kibana_system uživatelem.
+  # ---------------------------------------------------------------------------
+  kibana:
+    depends_on:
+      es-data-1:
+        condition: service_healthy
+      es-data-2:
+        condition: service_healthy
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
+    volumes:
+      - certs:/usr/share/kibana/config/certs
+      - kibana-data:/usr/share/kibana/data
+    ports:
+      - ${KIBANA_PORT}:5601
+    environment:
+      - SERVERNAME=kibana
+      - ELASTICSEARCH_HOSTS=https://es-data-1:9200
+      - ELASTICSEARCH_USERNAME=kibana_system
+      - ELASTICSEARCH_PASSWORD=${KIBANA_PASSWORD}
+      - ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES=config/certs/ca/ca.crt
+    mem_limit: ${MEM_LIMIT_DATA}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s -I http://localhost:5601 | grep -q 'HTTP/1.1 302 Found'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    networks:
+      - elk-net
+
+  # ---------------------------------------------------------------------------
+  # INIT – jednorázový kontejner pro vytvoření index templates
+  # Běží po startu clusteru, PŘED Logstash importem.
+  # Nastaví 3 shardy a 1 repliku pro všechny indexy.
+  # ---------------------------------------------------------------------------
+  init:
+    depends_on:
+      es-data-1:
+        condition: service_healthy
+      es-data-2:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+      - ./init:/usr/share/elasticsearch/init:ro
+    user: "0"
+    command: ["bash", "/usr/share/elasticsearch/init/setup.sh"]
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    networks:
+      - elk-net
+
+  # ---------------------------------------------------------------------------
+  # LOGSTASH – ETL pipeline pro import dat do ES
+  # Čte CSV soubory z mountnuté složky, transformuje a odesílá do ES.
+  # Závisí na init (index templates musí existovat před importem).
+  # ---------------------------------------------------------------------------
+  logstash:
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    image: docker.elastic.co/logstash/logstash:${STACK_VERSION}
+    volumes:
+      - certs:/usr/share/logstash/config/certs
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./logstash/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
+      - ./Data:/usr/share/logstash/data-input:ro
+    environment:
+      - xpack.monitoring.enabled=false
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+    mem_limit: ${MEM_LIMIT_DATA}
+    networks:
+      - elk-net
+
+# =============================================================================
+# VOLUMES – perzistentní úložiště
+# =============================================================================
+volumes:
+  certs:
+    driver: local
+  es-master-data:
+    driver: local
+  es-data-1-data:
+    driver: local
+  es-data-2-data:
+    driver: local
+  kibana-data:
+    driver: local
+
+# =============================================================================
+# NETWORKS – izolovaná síť pro ELK stack
+# =============================================================================
+networks:
+  elk-net:
+    driver: bridge

@@ -1,0 +1,12 @@
+# Definice oddelenych pipeline pro kazdy dataset
+# Bez tohoto souboru Logstash smerge vsechny .conf do jedne pipeline
+# a kazdy event projde vsemi filtry + outputy = znicena data
+
+- pipeline.id: tracks
+  path.config: "/usr/share/logstash/pipeline/tracks.conf"
+
+- pipeline.id: artists
+  path.config: "/usr/share/logstash/pipeline/artists.conf"
+
+- pipeline.id: charts
+  path.config: "/usr/share/logstash/pipeline/charts.conf"
