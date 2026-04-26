@@ -56,41 +56,54 @@ POST _reindex
 
 ---
 
-### A3 – Multi-get z vice indexu
+### A3 – Obohaceni charts o streaming tier
 
-Nactu konkretni skladby a interpreta z ruznych indexu v jednom requestu.
+Kazdemu chart zaznamu pridam kategorii podle poctu streamu a inverzni rank pro scoring.
 
 ```json
-POST _mget
+POST charts/_update_by_query
 {
-  "docs": [
-    { "_index": "tracks", "_id": "5MAK1nd8R6PWnle1Q1WJvh", "_source": ["track_name", "artists", "popularity"] },
-    { "_index": "tracks", "_id": "2tznHmp70DxMyr2XhWLOW0", "_source": ["track_name", "artists", "popularity"] },
-    { "_index": "artists", "_id": "7frYUe4C7A42uZqCzD34Y4", "_source": ["name", "followers", "popularity"] }
-  ]
+  "query": {
+    "bool": {
+      "filter": [
+        { "term": { "chart": "top200" } },
+        { "exists": { "field": "streams" } }
+      ]
+    }
+  },
+  "script": {
+    "source": "def s = ctx._source.streams; if (s > 1000000) ctx._source.stream_tier = 'viral'; else if (s > 100000) ctx._source.stream_tier = 'hit'; else ctx._source.stream_tier = 'niche'; ctx._source.rank_score = 201 - ctx._source.rank;",
+    "lang": "painless"
+  }
 }
 ```
 
-Misto 3 GET requestu jeden `_mget` – setri network roundtripy. Vraci "I See Red" (pop 76), "Cigarette Daydreams" (pop 79) a interpreta Sultaan (53636 followers).
+`update_by_query` s bool filtrem (jen top200 se streamy) + Painless s podminkami vytvori `stream_tier` (kategorizace) a `rank_score` (inverzni rank – cim vyssi pozice, tim vyssi skore). Aktualizovano ~5800 zaznamu.
 
 ---
 
-### A4 – Bulk operace
+### A4 – Klasifikace interpretu podle velikosti
 
-Vlozim 2 testovaci dokumenty, prvnimu zvysim popularitu na 100 a druhy smazu – vsechno v jednom POST.
+Kazdemu interpretovi pridam tier podle followers a spocitam pocet zanru.
 
 ```json
-POST _bulk
-{"index": {"_index": "tracks_popular", "_id": "custom_1"}}
-{"track_name": "Test Song Alpha", "artists": ["Test Artist"], "popularity": 99, "track_genre": "test", "danceability": 0.8}
-{"index": {"_index": "tracks_popular", "_id": "custom_2"}}
-{"track_name": "Test Song Beta", "artists": ["Test Artist 2"], "popularity": 50, "track_genre": "test", "danceability": 0.3}
-{"update": {"_index": "tracks_popular", "_id": "custom_1"}}
-{"doc": {"popularity": 100}, "doc_as_upsert": true}
-{"delete": {"_index": "tracks_popular", "_id": "custom_2"}}
+POST artists/_update_by_query
+{
+  "query": {
+    "bool": {
+      "filter": [
+        { "range": { "followers": { "gte": 0 } } }
+      ]
+    }
+  },
+  "script": {
+    "source": "def f = ctx._source.followers; if (f >= 1000000) ctx._source.artist_tier = 'mega'; else if (f >= 100000) ctx._source.artist_tier = 'major'; else if (f >= 10000) ctx._source.artist_tier = 'mid'; else ctx._source.artist_tier = 'indie'; ctx._source.genres_count = (ctx._source.containsKey('genres') && ctx._source.genres instanceof List) ? ctx._source.genres.size() : 0;",
+    "lang": "painless"
+  }
+}
 ```
 
-NDJSON format – strida se action + body. Podporuje `index`, `create`, `update`, `delete`. 4 operace bez chyb.
+Painless pristupuje k `followers` a pres podminky priradi tier. Pro `genres_count` kontroluje zda pole existuje a je List, pak vola `.size()`. Aktualizovano 5271 interpretu. Vysledek: mega (~50), major (~300), mid (~1500), indie (~3400).
 
 ---
 
@@ -120,24 +133,30 @@ Painless pristupuje k polim pres `ctx._source` a muze vytvaret nova pole. ES aut
 
 ---
 
-### A6 – Delete by query
+### A6 – Cross-index vyhledavani pres tracks a artists
 
-Smazu testovaci data se zanrem "test" z indexu `tracks_popular`.
+Hledam "love" soucasne ve skladbach i interpretech – jeden dotaz pres 2 indexy.
 
 ```json
-POST tracks_popular/_delete_by_query
+POST tracks,artists/_search
 {
+  "size": 5,
+  "_source": ["track_name", "name", "popularity", "followers", "track_genre", "genres"],
   "query": {
     "bool": {
-      "filter": [
-        { "term": { "track_genre": "test" } }
+      "must": [
+        { "multi_match": { "query": "love", "fields": ["track_name", "name"], "type": "best_fields" } }
+      ],
+      "should": [
+        { "range": { "popularity": { "gte": 60, "boost": 2 } } },
+        { "range": { "followers": { "gte": 100000, "boost": 1.5 } } }
       ]
     }
   }
 }
 ```
 
-Na rozdil od `DELETE /tracks_popular` (smaze cely index), tohle maze jen dokumenty matchujici query. Smazano 1 doc.
+`POST tracks,artists/_search` prohleda oba indexy najednou. `multi_match` hleda "love" v polich obou indexu (`track_name` v tracks, `name` v artists). `should` boostuje popularni skladby i velke interprety. Vysledek micha oba typy dokumentu – skladby s "Love" v nazvu i interprety jako "Lovejoy".
 
 ---
 
@@ -397,44 +416,69 @@ POST tracks/_search
 
 ---
 
-### C3 – Fuzzy hledani s preklepem
+### C3 – Fuzzy hledani + filtrace + agregace vysledku
 
-Umyslne spatne napsane "Bohemain Rapsody" – overuju ze ES najde spravny vysledek.
+Hledam s preklepem "Bohemain Rapsody", filtruji jen popularni, a agregatuji zanry nalezenych vysledku.
 
 ```json
 POST tracks/_search
 {
   "size": 3,
-  "_source": ["track_name", "artists", "popularity"],
+  "_source": ["track_name", "artists", "popularity", "track_genre"],
   "query": {
-    "match": {
-      "track_name": {
-        "query": "Bohemain Rapsody",
-        "fuzziness": "AUTO"
-      }
+    "bool": {
+      "must": {
+        "match": { "track_name": { "query": "Bohemain Rapsody", "fuzziness": "AUTO" } }
+      },
+      "filter": [
+        { "range": { "popularity": { "gte": 20 } } }
+      ]
     }
+  },
+  "aggs": {
+    "zanry_vysledku": {
+      "terms": { "field": "track_genre", "size": 5 }
+    },
+    "avg_popularita": { "avg": { "field": "popularity" } }
   }
 }
 ```
 
-`fuzziness: AUTO` pocita Levenshteinovu vzdalenost – pocet editaci nutnych k oprave. "Bohemain"→"Bohemian" (1 edit), "Rapsody"→"Rhapsody" (1 edit). Nalezena "Bohemian Rhapsody" od Queen (pop 75 a 82).
+Kombinuje fuzzy match (Levenshtein – "Bohemain"→"Bohemian", 1 edit) + bool filter (range popularity) + dve agregace nad vysledky. `fuzziness: AUTO` = 0 editu pro 1-2 znaky, 1 pro 3-5, 2 pro 6+. Najde 4 verze "Bohemian Rhapsody" (různé re-releases), agregace zanrů ukazuje rock, avg popularita: 63.25.
 
 ---
 
-### C4 – Analyze API – kroky zpracovani textu
+### C4 – Fraze s proximity (slop) + bool boost + highlight
 
-Ukazka jak analyzator krok za krokem zpracuje text.
+Hledam frazi "can't stop" s toleranci vzdalenosti slov, popularnejsi vyse.
 
 ```json
-POST _analyze
+POST tracks/_search
 {
-  "tokenizer": "standard",
-  "filter": ["lowercase", "stop", "snowball"],
-  "text": "The Bohemian Rhapsody is Playing Loudly"
+  "size": 5,
+  "_source": ["track_name", "artists", "popularity"],
+  "query": {
+    "bool": {
+      "must": {
+        "match_phrase": {
+          "track_name": {
+            "query": "can't stop",
+            "slop": 2
+          }
+        }
+      },
+      "should": [
+        { "range": { "popularity": { "gte": 60, "boost": 3 } } }
+      ]
+    }
+  },
+  "highlight": {
+    "fields": { "track_name": {} }
+  }
 }
 ```
 
-Pipeline: tokenizer rozdelil na 6 tokenu → lowercase → stop odstranil "the" a "is" → snowball (stemmer) zredukoval "Playing"→"play", "Loudly"→"loud", "Rhapsody"→"rhapsodi". Vysledek: ["bohemian", "rhapsodi", "play", "loud"]. Proto hledani "plays" najde i "playing" – oba se stemnou na "play".
+`match_phrase` vyzaduje slova ve spravnem poradi. `slop: 2` povoli max 2 slova mezi nimi – "Can't Stop the Feeling" (slop=1) i "Can't Stop Loving You" (slop=2) projdou. `should` boost zvyhodní popularnejsi vysledky. Highlight ukazuje kde se fraze nachazi: `<em>Can't</em> <em>Stop</em> the Feeling`.
 
 ---
 
@@ -560,21 +604,37 @@ POST _aliases
 
 ---
 
-### D3 – Zmena nastaveni indexu
+### D3 – Experiment s poctem replik a dopad na cluster
 
-Zmena refresh intervalu – urcuje jak casto se nova data stanou prohledatelnymi.
+Zvysim repliky ze 2 na 3 a ukazem, ze cluster nema dost uzlu pro jejich alokaci.
 
 ```json
-GET tracks/_settings
+// 1. Vychozi stav (replicas=2)
+GET _cluster/health/tracks
+// → green, active_shards: 9 (3P + 6R, 3 kopie per shard na 3 uzlech)
 
+// 2. Zvyseni replik na 3
 PUT tracks/_settings
-{ "index": { "refresh_interval": "5s" } }
+{ "index": { "number_of_replicas": 3 } }
 
+// 3. Kontrola distribuce
+GET _cat/shards/tracks?v&s=shard,prirep
+// → 3 nove repliky se statusem UNASSIGNED
+// (pro 4. kopii by byl potreba 4. datovy uzel – primary a repliky
+//  musi byt na ruznych uzlech)
+
+GET _cluster/health/tracks
+// → yellow, unassigned_shards: 3
+
+// 4. Navrat na 2 repliky
 PUT tracks/_settings
-{ "index": { "refresh_interval": "1s" } }
+{ "index": { "number_of_replicas": 2 } }
+
+GET _cluster/health/tracks
+// → green, unassigned_shards: 0
 ```
 
-`number_of_shards` je immutable po vytvoreni, ale `refresh_interval` a `number_of_replicas` se daji menit dynamicky. Pri hromadnem importu se refresh typicky zvysuje pro vykon.
+Demonstrace limitu topologie: se **3 datovymi uzly** lze mit max **2 repliky** (1 primary + 2 replica = 3 kopie na 3 ruznych uzlech). Pro `number_of_replicas >= 3` by byl treba 4+ datovy uzel. `number_of_replicas` je dynamicky parametr (na rozdil od `number_of_shards` ktery je immutable).
 
 ---
 
@@ -607,62 +667,162 @@ POST tracks/_search
 
 ---
 
-### D5 – Inspekce mappingu
+### D5 – Persistent runtime field v mappingu + agregace
 
-Overeni ze mapping odpovida definici v index template.
+Pridam trvale runtime pole `hit_potential` (kombinace popularity + danceability + energy) do mappingu.
 
 ```json
-GET tracks/_mapping/field/track_name,popularity,explicit,track_genre
+PUT tracks/_mapping
+{
+  "runtime": {
+    "hit_potential": {
+      "type": "double",
+      "script": "emit(doc['popularity'].value * 0.4 + doc['danceability'].value * 100 * 0.3 + doc['energy'].value * 100 * 0.3)"
+    }
+  }
+}
+
+POST tracks/_search
+{
+  "size": 5,
+  "fields": ["hit_potential"],
+  "_source": ["track_name", "artists", "popularity", "danceability", "energy"],
+  "sort": [{ "hit_potential": "desc" }],
+  "aggs": {
+    "hit_potential_per_genre": {
+      "terms": { "field": "track_genre", "size": 5 },
+      "aggs": {
+        "avg_hit": { "avg": { "field": "hit_potential" } }
+      }
+    }
+  }
+}
 ```
 
-Vysledek: `track_name` = text + keyword, `popularity` = integer, `explicit` = boolean, `track_genre` = keyword. Odpovida explicitnimu mappingu v template `spotify-tracks`.
+Na rozdil od D4 (per-query `runtime_mappings`) se runtime field v `_mapping` uklada trvale – dostupny pro vsechny budouci dotazy bez opetovne definice. Kombinuje 3 metriky do jednoho skore. Sort + vnorena agregace per zanr. Top zanry dle hit_potential: electronic ~58.2, disco ~56.0, reggae ~52.4, rock ~44.3, jazz ~31.4 (electronic má vysokou energii i danceability, proto skóre dominuje).
 
 ---
 
-### D6 – Index templates
+### D6 – Profilovani dotazu (execution plan)
 
-Zobrazeni vsech spotify templates.
+Pomoci `profile: true` zobrazim jak ES internee vykonava dotaz – na kterych shardech, jake operace, kolik casu.
 
 ```json
-GET _index_template/spotify-*
+POST tracks/_search
+{
+  "profile": true,
+  "size": 3,
+  "_source": ["track_name", "popularity"],
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "track_name": "love" } }
+      ],
+      "filter": [
+        { "term": { "track_genre": "pop" } },
+        { "range": { "popularity": { "gte": 50 } } }
+      ]
+    }
+  },
+  "aggs": {
+    "avg_danceability": { "avg": { "field": "danceability" } }
+  }
+}
 ```
 
-3 templates: `spotify-tracks`, `spotify-artists`, `spotify-charts`. Kazdy: 3 shardy, 1 replika, explicitni mapping. Priorita 100 = prednost pred default templates. Aplikuji se automaticky pri vytvoreni indexu.
+Response obsahuje `profile` sekci s detailnim breakdown: 3 shardy (shard 0, 1, 2), kazdy s BooleanQuery → TermQuery("love") + TermQuery("pop") + IndexOrDocValuesQuery(popularity ≥ 50). Viditelne casy per shard a per operace. Uzitecne pro optimalizaci pomalych dotazu – ukazuje kde ES travi nejvic casu.
 
 ---
 
 ## E) Cluster, distribuce a vypadek
 
-### E1 – Info o uzlech
+### E1 – Multi-search pres vsechny 3 indexy
 
-```
-GET _cat/nodes?v&h=name,role,heap.percent,ram.percent,cpu,disk.used_percent,node.role,master
-```
-
-3 uzly: `es-master` (role m, master *), `es-data-1` (di – data+ingest), `es-data-2` (di). Master nema data, ridi cluster state a alokaci shardu.
-
----
-
-### E2 – Distribuce shardu
-
-```
-GET _cat/shards/tracks,artists,charts?v&s=index,shard
-```
-
-Kazdy index ma 3 primary + 3 replica = 6 shardu. Primary a jeho replica jsou vzdy na ruznych uzlech. Celkem 18 shardu, 9 na kazdem datovem uzlu. Master nema zadne (nema data roli).
-
----
-
-### E3 – SQL dotaz
+Jeden HTTP request se 3 nezavislymi analytickymi dotazy – po jednom na kazdy dataset.
 
 ```json
-POST _sql?format=txt
-{
-  "query": "SELECT track_genre, COUNT(*) as pocet, ROUND(AVG(popularity),1) as avg_pop, ROUND(AVG(danceability),3) as avg_dance, ROUND(AVG(energy),3) as avg_energy FROM tracks GROUP BY track_genre ORDER BY COUNT(*) DESC LIMIT 10"
-}
+POST _msearch
+{"index": "tracks"}
+{"size": 0, "query": {"bool": {"filter": [{"range": {"popularity": {"gte": 50}}}]}}, "aggs": {"top_genres": {"terms": {"field": "track_genre", "size": 5}}, "avg_dance": {"avg": {"field": "danceability"}}}}
+{"index": "artists"}
+{"size": 0, "query": {"bool": {"filter": [{"range": {"followers": {"gte": 100000}}}]}}, "aggs": {"top_genres": {"terms": {"field": "genres", "size": 5}}, "avg_pop": {"avg": {"field": "popularity"}}}}
+{"index": "charts"}
+{"size": 0, "query": {"bool": {"filter": [{"term": {"chart": "top200"}}, {"range": {"rank": {"lte": 10}}}]}}, "aggs": {"per_region": {"terms": {"field": "region"}}, "avg_streams": {"avg": {"field": "streams"}}}}
 ```
 
-ES SQL internee prevadi na Query DSL agregace. Vysledek: reggae (1000, avg pop 20.6), pop (937, avg pop 50.0), classical (916, avg pop 13.3).
+`_msearch` posle 3 dotazy v jednom requestu (NDJSON – stridaji se header a body). Kazdy cili jiny index s vlastnim filtrem a agregacemi. Vysledek: popularni tracks = top zanry pop/hip-hop, avg dance 0.67; velci artists = top zanry rock/pop; top10 charts = prumer ~2.1M streamu per region. Setri network roundtripy.
+
+---
+
+### E2 – Shard preference – vliv distribuce na vysledky
+
+Porovnani vysledku pri dotazu na konkretni shard vs. vsechny shardy.
+
+```json
+// 1. Dotaz na vsechny shardy (default)
+POST tracks/_search
+{
+  "size": 0,
+  "query": { "bool": { "filter": { "term": { "track_genre": "rock" } } } },
+  "aggs": {
+    "count": { "value_count": { "field": "track_id" } },
+    "avg_pop": { "avg": { "field": "popularity" } }
+  }
+}
+// → 1000 docs, avg pop ~21
+
+// 2. Dotaz jen na shard 0
+POST tracks/_search?preference=_shards:0
+{
+  "size": 0,
+  "query": { "bool": { "filter": { "term": { "track_genre": "rock" } } } },
+  "aggs": {
+    "count": { "value_count": { "field": "track_id" } },
+    "avg_pop": { "avg": { "field": "popularity" } }
+  }
+}
+// → ~330 docs (1/3), avg pop ~20.5
+```
+
+`preference=_shards:0` smeruje dotaz jen na shard 0. Dokumenty se do shardu rozdeluji hashem `_id` → kazdy shard drzi ~1/3 rockovych skladeb. Avg popularity se mirne lisi (statisticky rozptyl na mensim vzorku). Ukazuje ze data NEJSOU na jednom miste, ale rovnomerne distribuovana.
+
+---
+
+### E3 – SQL dotaz s CASE, HAVING a prekladem do DSL
+
+Netrivialni SQL s podminenou agregaci (CASE WHEN), filtrovanim pres HAVING a nahledem na internal preklad do Query DSL.
+
+```json
+// 1. Samotny dotaz – percent explicit skladeb per zanr, jen zanry s >500 skladbami a avg pop >30
+POST _sql?format=txt
+{
+  "query": """
+    SELECT
+      track_genre,
+      COUNT(*)                                                       AS pocet,
+      ROUND(AVG(popularity), 1)                                      AS avg_pop,
+      ROUND(MIN(popularity), 1)                                      AS min_pop,
+      ROUND(MAX(popularity), 1)                                      AS max_pop,
+      SUM(CASE WHEN explicit = true THEN 1 ELSE 0 END)               AS explicit_count,
+      ROUND(100.0 * SUM(CASE WHEN explicit = true THEN 1 ELSE 0 END)
+            / COUNT(*), 1)                                           AS explicit_pct
+    FROM tracks
+    GROUP BY track_genre
+    HAVING COUNT(*) > 500 AND AVG(popularity) > 30
+    ORDER BY COUNT(*) DESC
+    LIMIT 10
+  """
+}
+
+// 2. Preklad SQL -> DSL (ES ukaze, jak internee prepisuje dotaz)
+POST _sql/translate
+{
+  "query": "SELECT track_genre, COUNT(*), AVG(popularity) FROM tracks GROUP BY track_genre HAVING COUNT(*) > 500"
+}
+// → vrati Query DSL s bucket_selector pipeline agregaci pro HAVING
+```
+
+`CASE WHEN` umoznuje podminenou agregaci (ekvivalent `filter` agregace v DSL). `HAVING` je filtr nad vysledkem agregace – internee se prevadi na `bucket_selector` pipeline agregaci. `ORDER BY COUNT(*) DESC` razeni dle poctu skladeb (ES SQL ma omezeni na ORDER BY agregat z SELECT, takze ne kazdy alias funguje). `_sql/translate` ukazuje, ze SQL neni "magie", ale syntaktickym cukrem nad Query DSL – uzitecne pro pochopeni, co se deje pod kapotou. Vysledek: electronic (981 skladeb, avg pop 44.3, 11.7 % explicit), pop (937, avg 50.0, 6.6 % explicit), hip-hop (758, avg 39.2, **37.2 % explicit – nejvyssi pomer ze vsech zanru**).
 
 ---
 
@@ -671,62 +831,119 @@ ES SQL internee prevadi na Query DSL agregace. Vysledek: reggae (1000, avg pop 2
 ```bash
 # 1. Pred vypadkem
 GET _cluster/health
-# → green, 3 uzly, 82 shardu
+# → green, 4 uzly (1 master + 3 data), 9 primary + 18 replica = 27 user shardu (per 3 indexy: 3P+6R)
+#   plus systemove indexy → celkem ~87 active_shards
 
-# 2. Zastavim datovy uzel
+# 2. Zastavim jeden datovy uzel
 docker compose stop es-data-2
 
-# 3. Cluster – yellow
+# 3. Cluster – yellow (2 datove uzly stale drzi vsechny primary + 1 repliku)
 GET _cluster/health
-# → yellow, 2 uzly, 41 active, 11 unassigned (repliky z padleho uzlu)
+# → yellow, 3 uzly, vsech 9 user primary STARTED, ~9 unassigned_shards
+#   (chybi 1 kopie z kazdeho shardu – ta co byla na es-data-2)
 
-# 4. Data stale dostupna
+# 4. Data stale dostupna – zadna ztrata, cluster ma stale 2 kopie vseho
 GET tracks/_count   → 13119
 GET artists/_count  → 5271
 
-# 5. Dotazy fungujou
+# 5. Dotazy fungujou plnou rychlosti
 GET tracks/_search {"query": {"match": {"track_name": "Bohemian Rhapsody"}}}
-# → 3 vysledky
+# → vysledky stejne jako pred vypadkem
 
-# 6. Obnovim uzel
-docker start nosql-es-data-2-1
+# 6. Zastavim druhy datovy uzel (stress test – zbyva jen 1 datovy uzel)
+docker compose stop es-data-3
+GET _cluster/health
+# → yellow, 2 uzly (master + es-data-1), ale vsechny primary shardy stale dostupne na es-data-1
+GET tracks/_count → 13119 (data jeste dostupna – cluster prezije 2 soucasne vypadky!)
 
-# 7. Cluster → green (ES automaticky synchronizuje repliky)
-GET _cluster/health → green, 3 uzly, 82 shardu
+# 7. Obnovim oba uzly
+docker compose start es-data-2 es-data-3
+
+# 8. Cluster → green (ES automaticky synchronizuje repliky)
+GET _cluster/health → green, 4 uzly, 9 primary + 18 replica active
 ```
 
-Yellow = primary shardy ok (data dostupna), repliky z padleho uzlu nejsou alokovane. Dotazy funguji protoze kazdy shard ma alespon 1 exemplar na zbyvajicim uzlu. Po restartu ES automaticky synchronizuje repliky a vraci se na green.
+**Klicovy pruvlom oproti 1-replika reseni:** s replikacnim faktorem 3 (1 primary + 2 replica) cluster **prezije soucasny vypadek 2 ze 3 datovych uzlu** bez ztraty dat. Yellow = degradovany stav (chybi kopie), ale data ok. RED by nastal az pri padu vsech 3 datovych uzlu.
 
-Scenare: padne 1 datovy uzel → yellow, data ok. Padnou oba datove uzly → red, data nedostupna. Padne master → datove uzly zvoli noveho (master election).
+Scenare:
+- Padne 1 data uzel → yellow, data ok, vykonnost mirne degradovana.
+- Padnou 2 data uzly → yellow, data ok, vsechno bezi z 1 uzlu.
+- Padnou vsechny 3 data uzly → red, data nedostupna.
+- Padne dedikovany master (es-master) → cluster nadale funguje, protoze vsechny 3 datove uzly maji roli `master,data,ingest` (HA setup). Quorum 3 ze 4 master-eligible uzlu zustava splnen, jeden z data uzlu je zvolen novym leaderem behem nekolika sekund. Cteni/zapis pokracuje bez prerusenii.
 
 ---
 
-### E5 – Allocation explain
+### E5 – Mereni latence dotazu pri degradovanem clusteru
 
-Proc je shard na konkretnim uzlu.
+Stejny analyticky dotaz pred a po vypadku uzlu – porovnani `took` v odpovedi.
 
 ```json
-POST _cluster/allocation/explain
+// 1. Stav: 4 uzly (master + 3 data), green – dotazy paralelne na 3 datove uzly
+POST tracks/_search
 {
-  "index": "tracks",
-  "shard": 0,
-  "primary": true
+  "size": 5,
+  "_source": ["track_name", "popularity"],
+  "query": {
+    "bool": {
+      "must": { "match": { "track_name": "love" } },
+      "filter": { "range": { "popularity": { "gte": 30 } } }
+    }
+  },
+  "aggs": {
+    "per_genre": { "terms": { "field": "track_genre", "size": 10 } },
+    "avg_energy": { "avg": { "field": "energy" } }
+  }
+}
+// → took: ~10ms, 156 hits (kazdy shard na vlastnim uzlu)
+
+// 2. docker compose stop es-data-2
+// → cluster yellow, 9 unassigned replica shardu
+
+// 3. Stejny dotaz – 2 datove uzly
+// POST tracks/_search { ... stejny dotaz ... }
+// → took: ~14ms, 156 hits (stejna data, mirne vyssi latence)
+
+// 4. docker compose stop es-data-3
+// → cluster yellow, 18 unassigned, vsechno jede z es-data-1
+
+// 5. Stejny dotaz – 1 datovy uzel
+// → took: ~22ms, 156 hits (vsech 3 shardy resi 1 uzel)
+
+// 6. docker compose start es-data-2 es-data-3
+// → po recovery (~30s) se cluster vrati na green a took se normalizuje
+```
+
+Vysledky (hits) jsou **vzdy identicke** – repliky zajistuji, ze kazdy shard ma kopii nejmene na 1 zivem uzlu. Latence (`took`) roste umerne tomu, na kolika uzlech dotaz bezi paralelne. Demonstrace **trade-off mezi dostupnosti a vykonem**: replikace zaruci kontinuitu sluzby i pri 2 soucasnych vypadcich, ale vykonnost klesne.
+
+---
+
+### E6 – Validace dat – kontrola konzistence a kvality
+
+Analyticky dotaz overujici kvalitu importovanych dat: duplicity, chybejici pole, rozlozeni.
+
+```json
+POST tracks/_search
+{
+  "size": 0,
+  "aggs": {
+    "celkem_dokumentu": { "value_count": { "field": "track_id" } },
+    "unikatnich_id": { "cardinality": { "field": "track_id" } },
+    "chybejici_zanr": { "missing": { "field": "track_genre" } },
+    "chybejici_popularita": { "missing": { "field": "popularity" } },
+    "rozlozeni_zanru": {
+      "terms": { "field": "track_genre", "size": 20 },
+      "aggs": {
+        "avg_popularity": { "avg": { "field": "popularity" } },
+        "min_popularity": { "min": { "field": "popularity" } },
+        "max_popularity": { "max": { "field": "popularity" } }
+      }
+    }
+  }
 }
 ```
 
-Shard 0 je na es-data-1, `can_remain: yes`, `can_rebalance_to_other: no` – uz je vyvazene. Uzitecne kdyz shardy zustanou UNASSIGNED – ES rekne presne proc.
+`value_count` vs `cardinality` odhali duplicity: 13119 celkem, ~12867 unikatnich (default `cardinality` agregace pouziva HyperLogLog++ aproximaci s `precision_threshold: 3000`, takze pri ~13k dokumentech ma 1-2% chybu; pro presny pocet by bylo treba `precision_threshold: 40000` → vrati 13121 ≈ 13119). Po deduplikaci Logstashem pres `document_id => "%{track_id}"` jsou track_id ve skutecnosti unikatni. `missing` zkontroluje chybejici pole (0 = data kompletni). Vnorena agregace per zanr ukazuje rozlozeni – reggae (1000, avg pop 20.6) vs pop (937, avg pop 50.0). Slouzi jako validace ETL pipeline.
 
----
-
-### E6 – Cluster stats
-
-```
-GET _cluster/stats
-```
-
-Celkovy prehled: 28217 dokumentu, 32 MB, 82 shardu (41P + 41R), 3 uzly, ES 8.17.0. Jedno API volani pro kompletni stav.
-
----
 
 ## Prehled
 
@@ -734,10 +951,10 @@ Celkovy prehled: 28217 dokumentu, 32 MB, 82 shardu (41P + 41R), 3 uzly, ES 8.17.
 |-----|---|-------|-----|
 | A | 1 | Hromadny update popularity | _update_by_query + Painless |
 | A | 2 | Reindex s filtraci | _reindex + query + script |
-| A | 3 | Multi-get | _mget |
-| A | 4 | Bulk operace | _bulk |
+| A | 3 | Obohaceni charts dat | _update_by_query + Painless conditionals |
+| A | 4 | Klasifikace interpretu | _update_by_query + Painless + .size() |
 | A | 5 | Skriptovany update | _update_by_query + Math |
-| A | 6 | Delete by query | _delete_by_query |
+| A | 6 | Cross-index vyhledavani | multi-index + multi_match + bool |
 | B | 1 | Prumer per zanr + pipeline | terms + avg + avg_bucket |
 | B | 2 | Range buckety + filter | range + avg + filter |
 | B | 3 | Casovy vyvoj | date_histogram + cumulative_sum |
@@ -746,19 +963,19 @@ Celkovy prehled: 28217 dokumentu, 32 MB, 82 shardu (41P + 41R), 3 uzly, ES 8.17.
 | B | 6 | Multi-terms | multi_terms + cardinality |
 | C | 1 | Slozeny bool | must/should/must_not/filter |
 | C | 2 | Multi-match + highlight | multi_match + boost + highlight |
-| C | 3 | Fuzzy | fuzziness AUTO |
-| C | 4 | Analyze pipeline | _analyze |
+| C | 3 | Fuzzy + filter + agregace | match fuzzy + bool + terms + avg |
+| C | 4 | Fraze s proximity | match_phrase + slop + bool + highlight |
 | C | 5 | Function score | field_value_factor + weight |
 | C | 6 | Autocomplete | match_phrase_prefix |
 | D | 1 | Custom analyzer | stop words + stemmer |
 | D | 2 | Aliasy | filtrovany + multi-index |
-| D | 3 | Index settings | refresh_interval |
+| D | 3 | Experiment s replikami | _settings + _cat/shards + health |
 | D | 4 | Runtime fields | runtime_mappings + Painless |
-| D | 5 | Inspekce mappingu | _mapping/field |
-| D | 6 | Index templates | _index_template |
-| E | 1 | Info o uzlech | _cat/nodes |
-| E | 2 | Distribuce shardu | _cat/shards |
-| E | 3 | SQL dotaz | _sql |
+| D | 5 | Persistent runtime field | _mapping runtime + sort + aggs |
+| D | 6 | Profilovani dotazu | profile: true + bool + aggs |
+| E | 1 | Multi-search 3 indexy | _msearch + bool + aggs per index |
+| E | 2 | Shard preference | preference=_shards + bool + aggs |
+| E | 3 | SQL: CASE + HAVING + translate | _sql + _sql/translate |
 | E | 4 | Vypadek uzlu | docker stop/start + recovery |
-| E | 5 | Allocation explain | _cluster/allocation/explain |
-| E | 6 | Cluster stats | _cluster/stats |
+| E | 5 | Latence pri vypadku | took comparison + bool + aggs |
+| E | 6 | Validace dat | cardinality + missing + terms + nested aggs |

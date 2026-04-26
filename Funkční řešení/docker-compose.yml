@@ -1,6 +1,6 @@
 # ELK Stack – Semestrální projekt
-# Elasticsearch 8.17 (3 uzly) + Logstash 8.17 + Kibana 8.17
-# Architektura: 1x dedicated master + 2x data+ingest
+# Elasticsearch 8.17 (4 uzly) + Logstash 8.17 + Kibana 8.17
+# Architektura: 1x dedikovaný master + 3x data+ingest (všechny 4 master-eligible — HA setup)
 
 services:
 
@@ -50,6 +50,12 @@ services:
           "      - localhost\n"\
           "    ip:\n"\
           "      - 127.0.0.1\n"\
+          "  - name: es-data-3\n"\
+          "    dns:\n"\
+          "      - es-data-3\n"\
+          "      - localhost\n"\
+          "    ip:\n"\
+          "      - 127.0.0.1\n"\
           > config/certs/instances.yml;
           bin/elasticsearch-certutil cert --silent --pem -out config/certs/certs.zip --in config/certs/instances.yml --ca-cert config/certs/ca/ca.crt --ca-key config/certs/ca/ca.key;
           unzip config/certs/certs.zip -d config/certs;
@@ -90,7 +96,7 @@ services:
       - node.roles=master
       - cluster.name=${CLUSTER_NAME}
       - cluster.initial_master_nodes=es-master
-      - discovery.seed_hosts=es-data-1,es-data-2
+      - discovery.seed_hosts=es-data-1,es-data-2,es-data-3
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
       - bootstrap.memory_lock=true
       - xpack.security.enabled=true
@@ -139,14 +145,18 @@ services:
       - ${ES_PORT}:9200
     environment:
       - node.name=es-data-1
-      - node.roles=data,ingest
+      - node.roles=master,data,ingest
       - cluster.name=${CLUSTER_NAME}
       - cluster.initial_master_nodes=es-master
-      - discovery.seed_hosts=es-master,es-data-2
+      - discovery.seed_hosts=es-master,es-data-2,es-data-3
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
       - bootstrap.memory_lock=true
       - xpack.security.enabled=true
       - xpack.security.http.ssl.enabled=true
+      - http.cors.enabled=true
+      - http.cors.allow-origin=http://localhost:8080
+      - http.cors.allow-headers=X-Requested-With,Content-Type,Content-Length,Authorization
+      - http.cors.allow-credentials=true
       - xpack.security.http.ssl.key=certs/es-data-1/es-data-1.key
       - xpack.security.http.ssl.certificate=certs/es-data-1/es-data-1.crt
       - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
@@ -156,7 +166,7 @@ services:
       - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
       - xpack.security.transport.ssl.verification_mode=certificate
       - xpack.license.self_generated.type=${LICENSE}
-      - ES_JAVA_OPTS=-Xms768m -Xmx768m
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
     mem_limit: ${MEM_LIMIT_DATA}
     ulimits:
       memlock:
@@ -188,10 +198,10 @@ services:
       - es-data-2-data:/usr/share/elasticsearch/data
     environment:
       - node.name=es-data-2
-      - node.roles=data,ingest
+      - node.roles=master,data,ingest
       - cluster.name=${CLUSTER_NAME}
       - cluster.initial_master_nodes=es-master
-      - discovery.seed_hosts=es-master,es-data-1
+      - discovery.seed_hosts=es-master,es-data-1,es-data-3
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
       - bootstrap.memory_lock=true
       - xpack.security.enabled=true
@@ -205,7 +215,56 @@ services:
       - xpack.security.transport.ssl.verification_mode=certificate
       - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
       - xpack.license.self_generated.type=${LICENSE}
-      - ES_JAVA_OPTS=-Xms768m -Xmx768m
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    mem_limit: ${MEM_LIMIT_DATA}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -s --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 120
+    networks:
+      - elk-net
+
+  # ---------------------------------------------------------------------------
+  # ES-DATA-3 – třetí datový uzel s ingest pipeline
+  # Přidán pro splnění požadavku „min. 3 repliky" (1 primary + 2 replica).
+  # ---------------------------------------------------------------------------
+  es-data-3:
+    depends_on:
+      es-master:
+        condition: service_healthy
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
+      - es-data-3-data:/usr/share/elasticsearch/data
+    environment:
+      - node.name=es-data-3
+      - node.roles=master,data,ingest
+      - cluster.name=${CLUSTER_NAME}
+      - cluster.initial_master_nodes=es-master
+      - discovery.seed_hosts=es-master,es-data-1,es-data-2
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - bootstrap.memory_lock=true
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=true
+      - xpack.security.http.ssl.key=certs/es-data-3/es-data-3.key
+      - xpack.security.http.ssl.certificate=certs/es-data-3/es-data-3.crt
+      - xpack.security.http.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.security.transport.ssl.enabled=true
+      - xpack.security.transport.ssl.key=certs/es-data-3/es-data-3.key
+      - xpack.security.transport.ssl.certificate=certs/es-data-3/es-data-3.crt
+      - xpack.security.transport.ssl.verification_mode=certificate
+      - xpack.security.transport.ssl.certificate_authorities=certs/ca/ca.crt
+      - xpack.license.self_generated.type=${LICENSE}
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
     mem_limit: ${MEM_LIMIT_DATA}
     ulimits:
       memlock:
@@ -232,6 +291,8 @@ services:
       es-data-1:
         condition: service_healthy
       es-data-2:
+        condition: service_healthy
+      es-data-3:
         condition: service_healthy
     image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
     volumes:
@@ -269,6 +330,8 @@ services:
         condition: service_healthy
       es-data-2:
         condition: service_healthy
+      es-data-3:
+        condition: service_healthy
     image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
     volumes:
       - certs:/usr/share/elasticsearch/config/certs
@@ -294,11 +357,25 @@ services:
       - certs:/usr/share/logstash/config/certs
       - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
       - ./logstash/pipelines.yml:/usr/share/logstash/config/pipelines.yml:ro
-      - ./Data:/usr/share/logstash/data-input:ro
+      - ../Data:/usr/share/logstash/data-input:ro
     environment:
       - xpack.monitoring.enabled=false
       - ELASTIC_PASSWORD=${ELASTIC_PASSWORD}
+      - LS_JAVA_OPTS=-Xms384m -Xmx384m
     mem_limit: ${MEM_LIMIT_DATA}
+    networks:
+      - elk-net
+
+  # ---------------------------------------------------------------------------
+  # ELASTICVUE – vizuální správa clusteru
+  # Zobrazuje uzly, shardy, indexy, search UI.
+  # ---------------------------------------------------------------------------
+  elasticvue:
+    image: cars10/elasticvue:1.0.8
+    ports:
+      - 8080:8080
+    environment:
+      - ELASTICVUE_CLUSTERS=[{"name":"spotify-elk-cluster","uri":"https://es-data-1:9200","username":"elastic","password":"${ELASTIC_PASSWORD}"}]
     networks:
       - elk-net
 
@@ -313,6 +390,8 @@ volumes:
   es-data-1-data:
     driver: local
   es-data-2-data:
+    driver: local
+  es-data-3-data:
     driver: local
   kibana-data:
     driver: local
