@@ -557,6 +557,9 @@ POST tracks/_search
 Spotify data casto obsahuji "Remastered", "feat." v nazvech. Vytvorim analyzator ktery tohle filtruje.
 
 ```json
+// Pro idempotentni spousteni: nejdrive smazat pripadny existujici index
+DELETE test_analyzer
+
 PUT test_analyzer
 {
   "settings": {
@@ -580,8 +583,16 @@ PUT test_analyzer
 }
 ```
 
-Test: `POST test_analyzer/_analyze {"analyzer": "spotify_analyzer", "text": "Bohemian Rhapsody - Remastered 2011 (feat. Someone)"}`
-Vysledek: ["bohemian", "rhapsodi", "2011", "someon"] – "Remastered" a "feat" odstranen, zbytek stemovan.
+Test:
+```json
+POST test_analyzer/_analyze
+{
+  "analyzer": "spotify_analyzer",
+  "text": "Bohemian Rhapsody - Remastered 2011 (feat. Someone)"
+}
+```
+
+Vysledek: `["bohemian", "rhapsodi", "2011", "someon"]` – "Remastered" a "feat" odstranen, zbytek stemovan. Pokud pri prvnim PUT dostanete `resource_already_exists_exception`, znamena to, ze index `test_analyzer` jiz existuje z predchoziho behu — staci provest `DELETE test_analyzer` a pak znovu `PUT`.
 
 ---
 
@@ -828,40 +839,65 @@ POST _sql/translate
 
 ### E4 – Simulace vypadku uzlu
 
-```bash
-# 1. Pred vypadkem
-GET _cluster/health
-# → green, 4 uzly (1 master + 3 data), 9 primary + 18 replica = 27 user shardu (per 3 indexy: 3P+6R)
-#   plus systemove indexy → celkem ~87 active_shards
+> **DULEZITE: Tento experiment kombinuje DVA typy prikazu:**
+> - **Prikazy zacinajici `docker compose ...`** se spousti **v TERMINALU** (z adresare `Funkční řešení/`).
+> - **Prikazy zacinajici `GET ...` nebo `POST ...`** se spousti **v Kibana Dev Tools** (☰ → Management → Dev Tools).
+>
+> Pokud spustis `docker compose stop` v Kibana Dev Tools, dostanes chybu 400 Bad Request (Kibana nezna metodu DOCKER).
 
-# 2. Zastavim jeden datovy uzel
-docker compose stop es-data-2
-
-# 3. Cluster – yellow (2 datove uzly stale drzi vsechny primary + 1 repliku)
-GET _cluster/health
-# → yellow, 3 uzly, vsech 9 user primary STARTED, ~9 unassigned_shards
-#   (chybi 1 kopie z kazdeho shardu – ta co byla na es-data-2)
-
-# 4. Data stale dostupna – zadna ztrata, cluster ma stale 2 kopie vseho
-GET tracks/_count   → 13119
-GET artists/_count  → 5271
-
-# 5. Dotazy fungujou plnou rychlosti
-GET tracks/_search {"query": {"match": {"track_name": "Bohemian Rhapsody"}}}
-# → vysledky stejne jako pred vypadkem
-
-# 6. Zastavim druhy datovy uzel (stress test – zbyva jen 1 datovy uzel)
-docker compose stop es-data-3
-GET _cluster/health
-# → yellow, 2 uzly (master + es-data-1), ale vsechny primary shardy stale dostupne na es-data-1
-GET tracks/_count → 13119 (data jeste dostupna – cluster prezije 2 soucasne vypadky!)
-
-# 7. Obnovim oba uzly
-docker compose start es-data-2 es-data-3
-
-# 8. Cluster → green (ES automaticky synchronizuje repliky)
-GET _cluster/health → green, 4 uzly, 9 primary + 18 replica active
+**Krok 1 — Pred vypadkem (Kibana Dev Tools):**
 ```
+GET _cluster/health
+```
+Ocekavany vysledek: green, 4 uzly (1 master + 3 data), 9 primary + 18 replica = 27 user shardu (per 3 indexy: 3P+6R), plus systemove indexy → celkem ~87 active_shards.
+
+**Krok 2 — Zastavim jeden datovy uzel (TERMINAL):**
+```bash
+docker compose stop es-data-2
+```
+
+**Krok 3 — Cluster yellow (Kibana Dev Tools):**
+```
+GET _cluster/health
+```
+Ocekavany vysledek: yellow, 3 uzly, vsech 9 user primary STARTED, ~9 unassigned_shards (chybi 1 kopie z kazdeho shardu – ta co byla na es-data-2).
+
+**Krok 4 — Data stale dostupna (Kibana Dev Tools):**
+```
+GET tracks/_count
+GET artists/_count
+```
+Ocekavany vysledek: tracks 13119, artists 5271 — zadna ztrata, cluster ma stale 2 kopie vseho.
+
+**Krok 5 — Dotazy fungujou plnou rychlosti (Kibana Dev Tools):**
+```
+GET tracks/_search
+{ "query": { "match": { "track_name": "Bohemian Rhapsody" } } }
+```
+Ocekavany vysledek: vysledky stejne jako pred vypadkem.
+
+**Krok 6 — Stress test, druhy uzel dolu (TERMINAL):**
+```bash
+docker compose stop es-data-3
+```
+
+**Krok 7 — Cluster yellow se 2 uzly (Kibana Dev Tools):**
+```
+GET _cluster/health
+GET tracks/_count
+```
+Ocekavany vysledek: yellow, 2 uzly (master + es-data-1), tracks/_count = 13119. Data dostupna – cluster prezije 2 soucasne vypadky.
+
+**Krok 8 — Obnovim oba uzly (TERMINAL):**
+```bash
+docker compose start es-data-2 es-data-3
+```
+
+**Krok 9 — Cluster zpet green (Kibana Dev Tools, pockat ~30 s):**
+```
+GET _cluster/health
+```
+Ocekavany vysledek: green, 4 uzly, 9 primary + 18 replica active. ES automaticky synchronizuje repliky.
 
 **Klicovy pruvlom oproti 1-replika reseni:** s replikacnim faktorem 3 (1 primary + 2 replica) cluster **prezije soucasny vypadek 2 ze 3 datovych uzlu** bez ztraty dat. Yellow = degradovany stav (chybi kopie), ale data ok. RED by nastal az pri padu vsech 3 datovych uzlu.
 

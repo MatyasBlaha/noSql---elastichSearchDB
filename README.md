@@ -15,34 +15,45 @@ Plně automatizované nasazení ELK stacku (Elasticsearch 8.17 + Logstash 8.17 +
 - **Docker Desktop** s minimálně **10 GiB RAM** (doporučeno 12 GiB) — Settings → Resources → Memory
 - Volné porty: `9200` (ES), `5601` (Kibana), `8080` (Elasticvue)
 
-## Spuštění
+## Spuštění (jediný příkaz)
 
 ```bash
 # 1. Vstup do složky s docker-compose
 cd "Funkční řešení"
 
-# 2. Zkopíruj vzor konfigurace
-cp .env.example .env
+# 2. Pokud .env NEEXISTUJE (např. po git clone), zkopíruj vzor:
+[ ! -f .env ] && cp .env.example .env
 
-# 3. (Volitelné) Uprav hesla v .env
-# 4. Spusť celý stack
+# 3. Spusť celý stack
 docker compose up -d
 ```
 
-Stack startuje ~3 minuty — Setup vygeneruje TLS certifikáty, ES uzly se spojí do clusteru, init kontejner vytvoří index templates, Logstash naimportuje 3 CSV ze složky `../Data/`.
+Stack startuje **~2-3 minuty**:
+- Setup vygeneruje TLS certifikáty (~6 s)
+- 4 ES uzly nabootují, master se zvolí leaderem (~80 s)
+- Init kontejner vytvoří 3 index templates (~5 s)
+- Logstash importuje 3 CSV ze složky `../Data/` (~60-90 s)
+- Kibana naběhne (~30 s)
 
 ## Ověření, že vše běží
 
 ```bash
-# Stav kontejnerů
+# 1. Stav kontejnerů (musí být všechny Up healthy, init/setup Exited (0))
 docker compose ps
 
-# Cluster health (musí být GREEN, 4 nodes)
+# 2. Cluster health (musí být GREEN, 4 nodes)
 curl -sk -u elastic:SpotifyELK2025! https://localhost:9200/_cluster/health?pretty
 
-# Počty dokumentů
+# 3. Počty dokumentů (očekávané: tracks 13119, artists 5271, charts 8000)
 curl -sk -u elastic:SpotifyELK2025! "https://localhost:9200/_cat/indices/tracks,artists,charts?v"
+
+# 4. Test fulltext search (musí vrátit 4× Bohemian Rhapsody i s překlepem):
+curl -sk -u elastic:SpotifyELK2025! -X POST "https://localhost:9200/tracks/_search?pretty" \
+  -H "Content-Type: application/json" \
+  -d '{"size":3,"_source":["track_name","popularity"],"query":{"match":{"track_name":{"query":"Bohemain Rapsody","fuzziness":"AUTO"}}}}'
 ```
+
+**Pokud všech 4 testy projdou → stack je 100% funkční.** Otevři Kibanu na http://localhost:5601 a klikni do **Discover** pro interaktivní vyhledávání.
 
 ## Přístupové body
 
@@ -85,6 +96,20 @@ noSql/
 docker compose down       # zachová data ve volumes
 docker compose down -v    # smaže VŠE (čistý stav)
 ```
+
+## 🚨 Troubleshooting
+
+| Problém | Příčina | Řešení |
+|---|---|---|
+| Kontejnery padají s `Exited (137)` | OOM kill — Docker Desktop má méně než 10 GiB RAM | Settings → Resources → Memory → posuň na **12 GiB** → Apply & Restart |
+| `master_not_discovered_exception` v curl | Master právě restartuje | Počkej 30 s, případně `docker compose restart es-master` |
+| Cluster trvá ve stavu yellow s mnoha unassigned shards | Recovery po startu — repliky se ještě alokují | Počkej 60 s, pak znovu zkontroluj health (mělo by se ustálit na green) |
+| Logstash přetěžuje CPU (1000 % +) | 3 paralelní pipelines × 10 workerů | Po dokončení importu: `docker compose stop logstash` (data už jsou v ES) |
+| Kibana „kibana server is not ready yet" | Kibana startuje pomalu (~30 s po ES) | Počkej 60 s |
+| Stack Monitoring v Kibaně „Access Denied" | Bug ES 8.x role check | Použij Dev Tools `_cat/*` dotazy místo Stack Monitoring |
+| Elasticvue (port 8080) prázdná stránka / nedostupná | Browser nedůvěřuje self-signed TLS certu ES | Klikni Open / Otevřít v Elasticvue → přesměruje na https://localhost:9200 → Advanced → Proceed (Chrome) nebo „visit this website" (Safari) → zavři login alert → vrať se na :8080 |
+| Elasticvue „400 Bad Request — Cookie Too Large" | Cookies overflow z jiných localhost služeb | Otevři v incognito okně (Chrome ⌘+Shift+N) |
+| Port 9200 / 5601 / 8080 obsazen | Předchozí spuštění ELK ještě běží, nebo jiná služba | `docker ps` → najdi konflikt → `docker stop <name>`, případně `docker compose down -v` v jiné složce |
 
 ## Detaily
 

@@ -1704,6 +1704,9 @@ Vysvětlení: `match_phrase_prefix` matchuje frázi a poslední slovo expanduje 
 Zadání: Spotify data často obsahují „Remastered", „feat.", „Remix" v názvech. Vytvořit analyzér, který tato slova filtruje a aplikuje stemming.
 
 ```json
+// Pro idempotentní spouštění: nejdřív smazat případný existující index
+DELETE test_analyzer
+
 PUT test_analyzer
 {
   "settings": {
@@ -2185,39 +2188,66 @@ Vysvětlení: `CASE WHEN` umožňuje podmíněnou agregaci (ekvivalent `filter` 
 
 Zadání: Zjistit, co se stane s clusterem a daty při zastavení jednoho nebo dvou datových uzlů.
 
-```bash
-# 1. Před výpadkem
-GET _cluster/health
-# → green, 4 uzly (1 master + 3 data), 9 primary + 18 replica = 27 shardů (3 indexy po 9)
+> **DŮLEŽITÉ – kombinace dvou prostředí:**
+> Tento experiment kombinuje příkazy ze dvou různých kontextů:
+> - **`docker compose stop / start`** se spouští v **terminálu** v adresáři `Funkční řešení/`.
+> - **`GET _cluster/health`, `GET tracks/_count`, `GET tracks/_search`** se spouští v **Kibana Dev Tools** (☰ → Management → Dev Tools).
+>
+> Pokud spustíte `docker compose stop` v Kibana Dev Tools, dostanete chybu HTTP 400 (Kibana neumí metodu `DOCKER`). Postup proto rozdělte do dvou oken/záložek.
 
-# 2. Zastavím jeden datový uzel
-docker compose stop es-data-2
-
-# 3. Cluster – yellow (2 datové uzly stále drží všechny primary + 1 repliku)
-GET _cluster/health
-# → yellow, 3 uzly, 9 active_primary_shards, 9 unassigned_shards
-#   (chybí 1 kopie z každého shardu – ta, co byla na es-data-2)
-
-# 4. Data stále dostupná – žádná ztráta, cluster má stále 2 kopie všeho
-GET tracks/_count   → 13119
-GET artists/_count  → 5271
-
-# 5. Dotazy fungují plnou rychlostí
-GET tracks/_search {"query": {"match": {"track_name": "Bohemian Rhapsody"}}}
-# → 3 výsledky
-
-# 6. Zastavím druhý datový uzel (stress test – zbývá jen 1 datový uzel)
-docker compose stop es-data-3
-GET _cluster/health
-# → yellow, 2 uzly (master + es-data-1), ale všechny primary shardy stále dostupné na es-data-1
-GET tracks/_count → 13119 (data jsou stále dostupná – cluster přežije 2 současné výpadky)
-
-# 7. Obnovím oba uzly
-docker compose start es-data-2 es-data-3
-
-# 8. Cluster → green (ES automaticky synchronizuje repliky)
-GET _cluster/health → green, 4 uzly, 27 shardů
+**Krok 1 — Před výpadkem (Kibana Dev Tools):**
 ```
+GET _cluster/health
+```
+Očekávaný výsledek: status `green`, 4 uzly (1 master + 3 data), 9 primary + 18 replica = 27 user shardů (3 indexy po 9), plus systémové indexy → celkem ~87 active_shards.
+
+**Krok 2 — Zastavím jeden datový uzel (terminál):**
+```bash
+docker compose stop es-data-2
+```
+
+**Krok 3 — Cluster yellow (Kibana Dev Tools):**
+```
+GET _cluster/health
+```
+Očekávaný výsledek: status `yellow`, 3 uzly, 9 active_primary_shards, 9 unassigned_shards (chybí 1 kopie z každého shardu – ta, co byla na es-data-2).
+
+**Krok 4 — Data stále dostupná (Kibana Dev Tools):**
+```
+GET tracks/_count
+GET artists/_count
+```
+Očekávaný výsledek: tracks 13119, artists 5271 — žádná ztráta, cluster má stále 2 kopie všeho.
+
+**Krok 5 — Dotazy fungují (Kibana Dev Tools):**
+```
+GET tracks/_search
+{ "query": { "match": { "track_name": "Bohemian Rhapsody" } } }
+```
+Očekávaný výsledek: 4 verze Bohemian Rhapsody, výsledky shodné s během před výpadkem.
+
+**Krok 6 — Stress test, druhý uzel dolů (terminál):**
+```bash
+docker compose stop es-data-3
+```
+
+**Krok 7 — Cluster yellow se 2 uzly (Kibana Dev Tools):**
+```
+GET _cluster/health
+GET tracks/_count
+```
+Očekávaný výsledek: yellow, 2 uzly (master + es-data-1), tracks/_count = 13119. Cluster přežil 2 současné výpadky bez ztráty dat.
+
+**Krok 8 — Obnovím oba uzly (terminál):**
+```bash
+docker compose start es-data-2 es-data-3
+```
+
+**Krok 9 — Cluster zpět green (Kibana Dev Tools, počkat ~30 s):**
+```
+GET _cluster/health
+```
+Očekávaný výsledek: status `green`, 4 uzly, 27 user shardů + systémové = ~87 active. ES automaticky synchronizoval repliky.
 
 Ukázka výstupu `GET _cluster/health` po vypnutí es-data-2:
 ```json
